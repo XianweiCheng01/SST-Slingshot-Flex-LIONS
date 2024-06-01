@@ -1,3 +1,16 @@
+Reconfigurable Optical Network
+Download the source code and compile it as suggested in SST/Macro
+
+The configuration files are in "skeletons/hpcg-3.0-test/".
+The "sd1_many_slingshot_lulesh.py" is used to running with lulesh.
+In sd1_many_slingshot_lulesh.py, "adaptive_routing", "bandwidth_steering", and "dynamic_steering" in getESwitch (line 629) are used to decide if SLINGSHOT, Flex-LIONS or New Approach are selected.
+In addition, the "wave_remap" need to be set correspondly (line 648, line 654 and line 656).
+
+The simulation can be executed with the command "sst sd1_many_slingshot_lulesh.py --timebase=1fs" or "mpirun -n 8 sst sd1_many_slingshot_lulesh.py --timebase=1fs"
+
+In the result, the "ele_forward" and "opt_forward" record the total number of electrical and optical transmission in each rack, which related to the number of hops.
+The "stat_lat_Rack", record the total latency of packets received from each rack for each rack.
+
 ![SST](http://sst-simulator.org/img/sst-logo-small.png)
 
 # Structural Simulation Toolkit (SST) Macroscale Element Library
@@ -27,4 +40,3 @@ Visit [sst-simulator.org](http://sst-simulator.org) to learn more about SST core
 
 Under the terms of Contract DE-NA0003525 with NTESS, 
 the U.S. Government retains certain rights in this software.
-
