@@ -1,0 +1,10 @@
+#! /usr/bin/env bash
+
+export PYTHONPATH=$PYTHONPATH:/home/xianwei/local/sstmacro/include/python
+export SST_LIB_PATH=/home/xianwei/local/sstmacro/lib:$SST_LIB_PATH
+export DYLD_LIBRARY_PATH=/home/xianwei/local/sstmacro/lib:$DYLD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/xianwei/local/sstmacro/lib:$LD_LIBRARY_PATH
+
+options="$@"
+/home/xianwei/local/sstcore/bin/sst /home/xianwei/new_source/sst-macro/build/../tests/api/mpi/config.py --model-options="$options"
+

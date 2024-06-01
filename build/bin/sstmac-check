@@ -1,0 +1,20 @@
+#! /usr/bin/env bash
+
+export PYTHONPATH=/home/xianwei/new_source/sst-macro/build/../python:$PYTHONPATH
+export SST_LIB_PATH=/home/xianwei/new_source/sst-macro/build/sstmac/install/.libs
+export DYLD_LIBRARY_PATH=/home/xianwei/new_source/sst-macro/build/sstmac/install/.libs:$DYLD_LIBRARY_PATH
+export DYLD_LIBRARY_PATH=/home/xianwei/new_source/sst-macro/build/sst-dumpi/dumpi/libundumpi/.libs:$DYLD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/xianwei/new_source/sst-macro/build/sstmac/install/.libs:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/xianwei/new_source/sst-macro/build/sst-dumpi/dumpi/libundumpi/.libs:$LD_LIBRARY_PATH
+
+options="$@"
+
+# macro partitioner currently broken:
+# Bad rank: 4294967295 4294967295
+# FATAL: [0:0] SST Core: ERROR: Bad partitioning; partition included unknown ranks.
+#/home/xianwei/local/sstcore/bin/sst /home/xianwei/new_source/sst-macro/build/../python/default.py --model-options="$options" --partitioner=macro.block
+
+# use default partitioner until it's fixed
+/home/xianwei/local/sstcore/bin/sst /home/xianwei/new_source/sst-macro/build/../python/default.py --model-options="$options"
+
+

@@ -1,0 +1,1434 @@
+/**
+Copyright 2009-2022 National Technology and Engineering Solutions of Sandia,
+LLC (NTESS).  Under the terms of Contract DE-NA-0003525, the U.S. Government
+retains certain rights in this software.
+
+Sandia National Laboratories is a multimission laboratory managed and operated
+by National Technology and Engineering Solutions of Sandia, LLC., a wholly
+owned subsidiary of Honeywell International, Inc., for the U.S. Department of
+Energy's National Nuclear Security Administration under contract DE-NA0003525.
+
+Copyright (c) 2009-2022, NTESS
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, 
+are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+
+    * Redistributions in binary form must reproduce the above
+      copyright notice, this list of conditions and the following
+      disclaimer in the documentation and/or other materials provided
+      with the distribution.
+
+    * Neither the name of the copyright holder nor the names of its
+      contributors may be used to endorse or promote products derived
+      from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Questions? Contact sst-macro-help@sandia.gov
+*/
+
+#ifndef slingshot_switch_CC
+#define slingshot_switch_CC
+
+#include <sstmac/hardware/switch/network_switch.h>
+#include <sstmac/hardware/flex_lion/slingshot_switch.h>
+#include <sstmac/hardware/node/node.h>
+#include <sstmac/hardware/topology/topology.h>
+#include <sstmac/hardware/interconnect/interconnect.h>
+#include <sstmac/hardware/nic/nic.h>
+#include <sstmac/common/event_manager.h>
+#include <sprockit/util.h>
+#include <sprockit/sim_parameters.h>
+#include <sprockit/keyword_registration.h>
+#include <sstmac/software/launch/launch_event.h>
+#include <random>
+#include <sstmac/hardware/flex_lion/slingshot_port.h>
+//using namespace SST;
+
+RegisterKeywords(
+{ "num_ports", "Total number of ports" },
+{ "num_pod", "number of links used for intra-pod connection" },
+{ "num_col", "number of links used for inter-pod connection column" },
+{ "num_row", "number of links used for inter-pod connection row" },
+{ "num_pod_ports", "number of ports per link used for intra-pod connection" },
+//{ "num_col_ports", "number of ports per link used for inter-pod connection column" },
+//{ "num_row_ports", "number of ports per link used for inter-pod connection row" },
+{ "num_links_per_node", "number of links of each node" },
+{ "num_nodes_per_switch", "number of nodes per switch connecting" },
+{ "num_switches", "number of switches in using" },
+);
+
+namespace sstmac {
+namespace hw {
+
+//num_ports, num_pod, num_col, num_row (the name for each port)
+//bandwitdth / next_free_time for each port
+//sendExecutionEvent(next_free_time, schedule_next_packet, port_id);
+//injection queues for each dest/ routing algorithm will decide the port
+//when reconfig execute the schedule_next_packet?
+
+SlingshotSwitch::SlingshotSwitch(uint32_t cid, SST::Params& params) :
+  OptSwitch(cid, params)
+{
+  SST::Params xbar_params = params.get_scoped_params("crossbar");
+  inj_byte_delay_ = TimeDelta(xbar_params.find<SST::UnitAlgebra>("bandwidth").getValue().inverse().toDouble());
+  inj_lat_ = TimeDelta(xbar_params.find<SST::UnitAlgebra>("latency").getValue().toDouble());
+  num_ports_per_switch_ = xbar_params.find<int>("num_ports", 64);
+
+  //ToR_id_ = cid;
+  switch_name_ = params.find<std::string>("switch_name");
+  ToR_id_ = params.find<int>("rackId", 0);
+  inter_lat_ = TimeDelta(params.find<SST::UnitAlgebra>("latency").getValue().toDouble());
+  forward_byte_delay_ = TimeDelta(params.find<SST::UnitAlgebra>("forward_bandwidth").getValue().inverse().toDouble());
+  num_links_layer_0_ = params.find<int>("num_pod", 15);
+  num_links_layer_1_ = params.find<int>("num_col", 0);
+  num_links_layer_2_ = params.find<int>("num_row", 0);
+  num_ports_per_link_layer_0_ = params.find<int>("num_pod_ports", 4);
+  num_ports_per_link_layer_1_ = params.find<int>("num_pod_ports", 4);
+  num_ports_per_link_layer_2_ = params.find<int>("num_pod_ports", 4);
+  //num_ports_per_link_layer_1_ = params.find<int>("num_col_ports", 4);
+  //num_ports_per_link_layer_2_ = params.find<int>("num_row_ports", 4);
+  num_switches_ = params.find<int>("num_switches", 32);
+  num_links_per_node_ = params.find<int>("num_links_per_node", 4);
+  num_nodes_per_switch_ = params.find<int>("num_nodes_per_switch", 4);
+  num_links_per_switch_ = num_links_per_node_ * num_nodes_per_switch_;
+  num_nodes_ = num_switches_*num_nodes_per_switch_;
+  num_local_links_ = num_nodes_*num_links_per_node_;
+
+  thr_inter_rack_ = params.find<int>("thr_inter_rack", 8000);
+  thr_intra_rack_ = params.find<int>("thr_intra_rack", 4000);
+
+  adaptive_routing_ = params.find<bool>("adaptive_routing", false);
+  bandwidth_steering_ = params.find<bool>("bandwidth_steering", false);
+  dynamic_steering_ = params.find<bool>("dynamic_steering", false);
+
+  stat_inter_rack_byte_counting_.resize((num_links_layer_0_+1)*(num_links_layer_1_+1)*(num_links_layer_2_+1), 0);
+  stat_inter_rack_packet_counting_.resize((num_links_layer_0_+1)*(num_links_layer_1_+1)*(num_links_layer_2_+1), 0);
+  stat_inter_rack_lat_counting_.resize((num_links_layer_0_+1)*(num_links_layer_1_+1)*(num_links_layer_2_+1), 0);
+
+  stat_ele_forward_counting_ = 0;
+  stat_opt_forward_counting_ = 0;
+
+  num_ports_layer_0_ = num_links_layer_0_*num_ports_per_link_layer_0_;
+  num_ports_layer_1_ = num_links_layer_1_*num_ports_per_link_layer_1_;
+  num_ports_layer_2_ = num_links_layer_2_*num_ports_per_link_layer_2_;
+
+  next_forward_layer_0_free_.resize(num_ports_layer_0_);
+  next_forward_layer_1_free_.resize(num_ports_layer_1_);
+  next_forward_layer_2_free_.resize(num_ports_layer_2_);
+
+  num_global_ports_ = num_ports_layer_0_+num_ports_layer_1_+num_ports_layer_2_;
+
+  layer_0_idx_ = ToR_id_%(num_links_layer_0_ + 1);
+  layer_1_idx_ = (ToR_id_/(num_links_layer_0_ + 1))%(num_links_layer_1_ + 1);
+  layer_2_idx_ = (ToR_id_/((num_links_layer_0_ + 1)*(num_links_layer_1_ + 1)))%(num_links_layer_2_ + 1);
+  //configureLogPLinks();
+
+  local_links_.resize(num_nodes_);
+  
+  for (int i=0; i<num_nodes_; i++) {
+    local_links_[i].resize(num_links_per_node_);
+    for (int j=0; j<num_links_per_node_; j++) {
+      SST::Params port_params = params.get_scoped_params("slingshot_port");
+      port_params.insert("port_id", std::to_string(i));
+      port_params.insert("wave_id", std::to_string(j));
+      port_params.insert("port_name", switch_name_+sprockit::sprintf("local_%d_%d",i,j));
+      port_params.insert("real_port_name", sprockit::sprintf("local_%d_%d",i,j));
+      local_links_[i][j] = loadAnonymousSubComponent<OptPort>("macro.slingshot_port", "local_port", i*num_links_per_node_+j, 0x7,
+        port_params, this);
+      //std::cout << "Test 0 in Slingshot with node_id " << i << " link_id " << j << std::endl;
+      fflush(stdout);
+      //local_links_[i][j] = 
+    }
+    //std::cout << "Test 0 in Slingshot with rack " << ToR_id_ << " i " << i << " size " << local_links_[i].size() << std::endl;
+    fflush(stdout);
+  }
+
+  if (num_links_layer_0_ > 0) {
+    layer_0_links_.resize(num_ports_per_link_layer_0_);
+    layer_0_r_links_.resize(num_ports_per_link_layer_0_);
+    layer_0_config_.resize(num_ports_per_link_layer_0_);
+    for (int i=0; i<num_ports_per_link_layer_0_; i++) {
+      layer_0_links_[i].resize(num_links_layer_0_);
+      layer_0_r_links_[i].resize(num_links_layer_0_);
+      layer_0_config_[i].resize(num_links_layer_0_);
+      for (int j=0; j<num_links_layer_0_; j++) {
+        SST::Params port_params = params.get_scoped_params("slingshot_port");
+        port_params.insert("port_id", std::to_string(num_nodes_+i));
+        port_params.insert("wave_id", std::to_string(j));
+        port_params.insert("port_name", switch_name_+sprockit::sprintf("port_0_%d_%d",i,j));
+        port_params.insert("real_port_name", sprockit::sprintf("port_0_%d_%d",i,j));
+        //std::string name = sprockit::sprintf("port_0_%d", i);
+        layer_0_links_[i][j] = loadAnonymousSubComponent<OptPort>("macro.slingshot_port", "layer_0_port", i*num_links_layer_0_+j, 0x7,
+          port_params, this);
+
+        SST::Params port_r_params = params.get_scoped_params("slingshot_port");
+        port_r_params.insert("port_id", std::to_string(num_nodes_+i));
+        port_r_params.insert("wave_id", std::to_string(j));
+        port_r_params.insert("port_name", switch_name_+sprockit::sprintf("port_r_0_%d_%d",i,j));
+        port_r_params.insert("real_port_name", sprockit::sprintf("port_r_0_%d_%d",i,j));
+        layer_0_r_links_[i][j] = loadAnonymousSubComponent<OptPort>("macro.slingshot_port", "layer_0_r_port", i*num_links_layer_0_+j, 0x7,
+          port_r_params, this);
+        if (dynamic_steering_) {
+          layer_0_config_[i][j] = -1;
+        } else {
+          layer_0_config_[i][j] = 0;
+        }
+      }
+    }
+  }
+
+  if (num_links_layer_1_ > 0) {
+    layer_1_links_.resize(num_ports_per_link_layer_1_);
+    layer_1_r_links_.resize(num_ports_per_link_layer_1_);
+    layer_1_config_.resize(num_ports_per_link_layer_1_);
+    for (int i=0; i<num_ports_per_link_layer_1_; i++) {
+      layer_1_links_[i].resize(num_links_layer_1_);
+      layer_1_r_links_[i].resize(num_links_layer_1_);
+      layer_1_config_[i].resize(num_links_layer_1_);
+      for (int j=0; j<num_links_layer_1_; j++) {
+        SST::Params port_params = params.get_scoped_params("slingshot_port");
+        port_params.insert("port_id", std::to_string(num_nodes_+num_ports_per_link_layer_0_+i));
+        port_params.insert("wave_id", std::to_string(j));
+        port_params.insert("port_name", switch_name_+sprockit::sprintf("port_1_%d_%d",i,j));
+        port_params.insert("real_port_name", sprockit::sprintf("port_1_%d_%d",i,j));
+        //std::string name = sprockit::sprintf("port_0_%d", i);
+        layer_1_links_[i][j] = loadAnonymousSubComponent<OptPort>("macro.slingshot_port", "layer_1_port", i*num_links_layer_1_+j, 0x7,
+          port_params, this);
+
+        SST::Params port_r_params = params.get_scoped_params("slingshot_port");
+        port_r_params.insert("port_id", std::to_string(num_nodes_+num_ports_per_link_layer_0_+i));
+        port_r_params.insert("wave_id", std::to_string(j));
+        port_r_params.insert("port_name", switch_name_+sprockit::sprintf("port_r_1_%d_%d",i,j));
+        port_r_params.insert("real_port_name", sprockit::sprintf("port_r_1_%d_%d",i,j));
+        layer_1_r_links_[i][j] = loadAnonymousSubComponent<OptPort>("macro.slingshot_port", "layer_1_r_port", i*num_links_layer_1_+j, 0x7,
+          port_r_params, this);
+        layer_1_config_[i][j] = 0;
+      }
+    }
+  }
+
+  if (num_links_layer_2_ > 0) {
+    layer_2_links_.resize(num_ports_per_link_layer_2_);
+    layer_2_r_links_.resize(num_ports_per_link_layer_2_);
+    layer_2_config_.resize(num_ports_per_link_layer_2_);
+    for (int i=0; i<num_ports_per_link_layer_2_; i++) {
+      layer_2_links_[i].resize(num_links_layer_2_);
+      layer_2_r_links_[i].resize(num_links_layer_2_);
+      layer_2_config_[i].resize(num_links_layer_2_);
+      for (int j=0; j<num_links_layer_2_; j++) {
+        SST::Params port_params = params.get_scoped_params("slingshot_port");
+        port_params.insert("port_id", std::to_string(num_nodes_+num_ports_per_link_layer_0_+num_ports_per_link_layer_1_+i));
+        port_params.insert("wave_id", std::to_string(j));
+        port_params.insert("port_name", switch_name_+sprockit::sprintf("port_2_%d_%d",i,j));
+        port_params.insert("real_port_name", sprockit::sprintf("port_2_%d_%d",i,j));
+
+        SST::Params port_r_params = params.get_scoped_params("slingshot_port");
+        port_r_params.insert("port_id", std::to_string(num_nodes_+num_ports_per_link_layer_0_+num_ports_per_link_layer_1_+i));
+        port_r_params.insert("wave_id", std::to_string(j));
+        port_r_params.insert("port_name", switch_name_+sprockit::sprintf("port_r_2_%d_%d",i,j));
+        port_r_params.insert("real_port_name", sprockit::sprintf("port_r_2_%d_%d",i,j));
+
+        //std::string name = sprockit::sprintf("port_0_%d", i);
+        layer_2_links_[i][j] = loadAnonymousSubComponent<OptPort>("macro.slingshot_port", "layer_2_port", i*num_links_layer_2_+j, 0x7,
+          port_params, this);
+        layer_2_r_links_[i][j] = loadAnonymousSubComponent<OptPort>("macro.slingshot_port", "layer_2_r_port", i*num_links_layer_2_+j, 0x7,
+          port_r_params, this);
+        layer_2_config_[i][j] = 0;
+      }
+    }
+  }
+
+  std::vector<int> local_wave_remap;
+  layer_0_shortest_routing_.resize(num_links_layer_0_+1);
+  if (bandwidth_steering_ || dynamic_steering_) {
+    std::vector<int> tmp_wave_remap;
+    std::vector<std::vector<int>> tmp_shortest_routing = {
+      {},{1},{2},{3},{1,2},{5},{6},{1,5},{2,6},{2,5},{3,5},{3,6},{6},{1,2},{5},{5},
+      {0},{},{0,2,4},{0},{4},{0,4},{6},{7},{6},{6,7},{6},{6},{4,6},{4,7},{0,4},{0,4},
+      {0},{0,3},{},{3},{4},{5},{0,8},{5,9},{8},{9},{3,5},{3,9},{4,9},{4,8},{5,8},{5,9},
+      {0},{1},{2},{},{1,2},{5},{0,1},{1,5},{2},{2,5},{10},{11},{10},{10},{5,11},{5},
+      {1,2},{1},{2},{2,5},{},{5},{1,12},{1,5},{2},{2,5},{5,12},{2,5},{12},{13},{5,12},{12,5},
+      {0},{0,3},{2},{3},{4},{},{0,7},{7},{2,9},{9},{10},{3,9},{4,7},{4,7},{14},{15},
+      {0},{1},{0,8},{0,10},{1,12},{0,7},{},{7},{8},{9},{10},{11},{12},{7,8},{8,9},{9,12},
+      {1,5},{1},{5,9},{1,5},{1,5},{5},{6},{},{6,9},{9},{5,6},{6,9},{12},{13},{5,9},{5,9},
+      {2,6},{6},{2},{2},{2,13},{2,9},{6},{6,9},{},{9},{6,13},{6,9},{6,9},{13},{14},{9,13},
+      {2,5},{6,7},{2},{2,5},{2,5},{5},{6},{7},{8},{},{5,6},{11},{12},{7,8},{14},{15},
+      {3,5},{3,6},{3,5},{3},{5,12},{5},{6},{5,6},{6},{5,6},{},{11},{12},{13},{5,11},{5,12},
+      {3,6},{3,6},{3,9},{3},{3,6},{3,9},{6},{6,9},{6,9},{9},{10},{},{6,9},{10},{14},{9,14},
+      {6},{4,6},{4,9},{10},{4},{4},{6},{7},{6,9},{9},{10},{6,9},{},{13},{14},{15},
+      {4,7},{4,7},{4},{10},{4},{4,7},{7,10},{7},{4,7},{7,12},{10},{10},{12},{},{12,15},{15},
+      {5},{5,11},{5,8},{5,11},{5,12},{5},{8,9},{5,9},{8},{9},{5,11},{11},{12},{8,12},{},{15},
+      {5},{5,12},{5,9},{5},{5},{5},{9,12},{5,9},{9,14},{9},{5,12},{9,14},{12},{13},{14},{}
+      };
+    /**
+    std::vector<std::vector<int>> tmp_shortest_routing = {
+      {},{1},{2},{2},{2,5},{5},{5},{5},{5},{5,11},{11},{11},{11},{11},{11},{11},
+      {0},{},{2},{2},{2},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},
+      {0},{1},{},{3},{4},{0,4},{0,4},{0,4},{0,4},{0,4},{0},{0},{0},{0},{0},{0},
+      {2},{2},{2},{},{4},{4},{4},{4},{4},{4},{4,2},{2},{4,2},{2},{2},{2},
+      {2,5},{2},{2},{3},{},{5},{5},{5},{5},{5},{5},{2,5},{5},{2,5},{2,5},{2,5},
+      {0},{0},{0,4},{4},{4},{},{6},{7},{8},{9},{8,9},{0,9},{9},{0,9},{0,9},{0,9},
+      {5},{5},{5},{5},{5},{5},{},{7},{5,7},{5},{5,7},{5},{5},{5},{5},{5},
+      {5},{5},{5},{5},{5},{5},{6},{},{8},{5,8},{8},{5,8},{5,8},{5,8},{5,8},{5,8},
+      {7,9},{7,9},{7,9},{7,9},{7,9},{7,9},{7},{7},{},{9},{10},{9,10},{9},{9,10},{9,10},{9,10},
+      {5},{5},{5},{5},{5},{5},{5},{5,8},{8},{},{10},{11},{12},{11,12},{11,12},{11,12},
+      {9},{9},{9},{9},{9},{9},{9},{9},{9},{9},{},{11},{9,11},{11},{11},{11},
+      {9},{9},{9},{9},{9},{9},{9},{9},{9},{9},{10},{},{12},{13},{14},{14},
+      {9},{9},{9},{9},{9},{9},{9},{9},{9},{9},{9,11},{11},{},{13},{14},{14},
+      {12},{12},{12},{12},{12},{12},{12},{12},{12},{12},{12},{12},{12},{},{14},{14},
+      {12},{12},{12},{12},{12},{12},{12},{12},{12},{12},{12},{12},{12},{13},{},{15},
+      {14},{14},{14},{14},{14},{14},{14},{14},{14},{14},{14},{14},{14},{14},{14},{}
+      };
+    /**/
+    if (dynamic_steering_) {
+      tmp_shortest_routing = {
+        {},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},
+        {0},{},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},
+        {0},{1},{},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},
+        {0},{1},{2},{},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},
+        {0},{1},{2},{3},{},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},
+        {0},{1},{2},{3},{4},{},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},
+        {0},{1},{2},{3},{4},{5},{},{7},{8},{9},{10},{11},{12},{13},{14},{15},
+        {0},{1},{2},{3},{4},{5},{6},{},{8},{9},{10},{11},{12},{13},{14},{15},
+        {0},{1},{2},{3},{4},{5},{6},{7},{},{9},{10},{11},{12},{13},{14},{15},
+        {0},{1},{2},{3},{4},{5},{6},{7},{8},{},{10},{11},{12},{13},{14},{15},
+        {0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{},{11},{12},{13},{14},{15},
+        {0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{},{12},{13},{14},{15},
+        {0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{},{13},{14},{15},
+        {0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{},{14},{15},
+        {0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{},{15},
+        {0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{},
+        };
+    }
+    params.find_array("wave_remap", tmp_wave_remap);
+    //params.find_array("shortest_routing", tmp_shortest_routing);
+    local_wave_remap.resize(num_links_layer_0_+1);
+    //local_shortest_routing.resize(num_links_layer_0_);
+    for (int idx_i = 0; idx_i<num_links_layer_0_+1; idx_i++) {
+      local_wave_remap[idx_i] = tmp_wave_remap[(num_links_layer_0_+1)*ToR_id_+idx_i];
+      for (int i = 0; i<tmp_shortest_routing[(num_links_layer_0_+1)*ToR_id_+idx_i].size(); i++) {
+        layer_0_shortest_routing_[idx_i].push_back(tmp_shortest_routing[(num_links_layer_0_+1)*ToR_id_+idx_i][i]);
+      }
+    }
+  }
+
+  layer_0_bw_steering_.resize(num_links_layer_0_+1);
+  for (int idx=0; idx<num_links_layer_0_+1; idx++) {
+    if (bandwidth_steering_ || dynamic_steering_) {
+      if (local_wave_remap[idx] != -1) {
+        if ((local_wave_remap[idx] != idx) && (idx != ToR_id_) && bandwidth_steering_ && !dynamic_steering_) {
+          for (int i=0; i<num_ports_per_link_layer_0_; i++) {
+            layer_0_config_[i][idx-((ToR_id_>idx)?0:1)] = 1;
+          }
+        }
+        if (dynamic_steering_) {
+          layer_0_ds_dst_ = local_wave_remap[idx];
+        }
+        layer_0_bw_steering_[local_wave_remap[idx]].push_back(idx);
+      }
+    } else {
+      layer_0_bw_steering_[idx].push_back(idx);
+    }
+  }
+
+  layer_1_bw_steering_.resize(num_links_layer_1_+1);
+  layer_1_shortest_routing_.resize(num_links_layer_1_+1);
+  for (int idx=0; idx<num_links_layer_1_+1; idx++) {
+    layer_1_bw_steering_[idx].push_back(idx);
+  }
+
+  layer_2_bw_steering_.resize(num_links_layer_2_+1);
+  layer_2_shortest_routing_.resize(num_links_layer_2_+1);
+  for (int idx=0; idx<num_links_layer_2_+1; idx++) {
+    layer_2_bw_steering_[idx].push_back(idx);
+  }
+
+  input_queues_.resize(num_switches_);
+  input_queues_byte_.resize(num_switches_);
+  next_xbar_in_free_.resize(num_switches_);
+  next_xbar_out_free_.resize(num_switches_);
+  port_pri_.resize(num_switches_);
+  for (int i=0; i<num_switches_; i++) {
+    input_queues_[i].resize(num_ports_per_switch_);
+    input_queues_byte_[i].resize(num_ports_per_switch_, 0);
+    next_xbar_in_free_[i].resize(num_ports_per_switch_);
+    next_xbar_out_free_[i].resize(num_ports_per_switch_);
+    port_pri_[i].resize(num_ports_per_switch_);
+    for (int j=0; j<num_ports_per_switch_; j++) {
+      input_queues_[i][j].resize(num_ports_per_switch_);
+      //input_queues_byte_[i][j].resize(num_ports_per_switch_, 0);
+      port_pri_[i][j] = j;
+    }
+  }
+
+  //std::cout << "Test 0 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+  fflush(stdout);
+}
+
+SlingshotSwitch::~SlingshotSwitch()
+{
+}
+
+void SlingshotSwitch::input_port(int port_id, int wave_id, NetworkMessage* msg)
+{
+  //int s_id = ////
+  //int inport = ////
+  int s_id = port_id/num_nodes_per_switch_;
+  int inport = (port_id%num_nodes_per_switch_)*num_links_per_node_+wave_id;
+  if (port_id >= num_nodes_) {
+    //global port/wave id --> switch id and port id
+    s_id = (wave_id % num_switches_);
+    int num_layer_0_per_link_ports = (num_links_layer_0_+num_switches_-1)/num_switches_;//wavelengths / switches
+    int num_layer_1_per_link_ports = (num_links_layer_1_+num_switches_-1)/num_switches_;
+    int num_layer_2_per_link_ports = (num_links_layer_2_+num_switches_-1)/num_switches_;
+
+    int num_layer_0_ports = num_ports_per_link_layer_0_*num_layer_0_per_link_ports; //ports per link
+    int num_layer_1_ports = num_ports_per_link_layer_1_*num_layer_1_per_link_ports;
+    int num_layer_2_ports = num_ports_per_link_layer_2_*num_layer_2_per_link_ports;
+
+    if (port_id < num_nodes_ + num_layer_0_ports) {
+      inport = num_links_per_switch_ + num_switches_ - 1 
+        + (port_id - num_nodes_) * num_layer_0_per_link_ports
+        + (wave_id/num_switches_);
+    } else if (port_id < num_nodes_ + num_layer_0_ports + num_layer_1_ports) {
+      inport = num_links_per_switch_ + num_switches_ - 1
+        + num_layer_0_ports
+        + (port_id - num_nodes_ - num_layer_0_ports)
+        * num_layer_1_per_link_ports
+        + (wave_id/num_switches_);
+    } else if (port_id < num_nodes_ + num_layer_0_ports + num_layer_1_ports + num_layer_2_ports) {
+      inport = num_links_per_switch_ + num_switches_ - 1
+        + num_layer_0_ports
+        + num_layer_1_ports
+        + (port_id - num_nodes_ - num_layer_0_ports - num_layer_1_ports)
+        * num_layer_2_per_link_ports
+        + (wave_id/num_switches_);
+    } else {
+      sprockit::abort("The port_id, wave_id out of range of the Slingshot Switch");
+    }
+  } else {
+    //counting the inter-rack communication
+    stat_inter_rack_byte_counting_[msg->toaddr()/num_nodes_] += msg->byteLength();
+    stat_inter_rack_packet_counting_[msg->toaddr()/num_nodes_]++;
+  }
+  //std::cout << "Test 0 in input_port of flex_lion/slingshot_switch.cc port_id " << port_id << " wave_id " << wave_id << " s_id " << s_id << " inport " << inport << std::endl;
+  fflush(stdout);
+  input_queue(s_id, inport, msg);
+}
+
+void SlingshotSwitch::input_queue(int s_id, int inport, NetworkMessage* msg)
+{
+  int outlink = input_routing(s_id, msg);
+  Timestamp now_ = now();
+    //if ((inport >= num_links_per_switch_ && outlink >= num_links_per_switch_) || outlink >= num_links_per_switch_+num_switches_-1) {
+    //  std::cout << "Test -1 in input_queue of flex_lion/slingshot_switch.cc s_id " << s_id << " inport " << inport << " outlink " << outlink << " dst " << msg->toaddr() << " msg: " << msg << " now: " << now_.nsec() << " links: " << num_links_per_switch_ << " switches: " << num_switches_ << std::endl;
+    //  fflush(stdout);
+    //}
+  //if ((outlink >= num_links_per_switch_) && (outlink < num_links_per_switch_ + num_switches_ - 1)) {
+    //if (ToR_id_ == ((msg->toaddr())/num_nodes_)) {
+      input_queues_[s_id][inport][outlink].push_back(msg);
+    //} else {
+    //  input_queues_[s_id][inport][outlink].push_front(msg);
+    //}
+  //} else {
+  //  input_queues_[s_id][inport][outlink].push_back(msg);
+  //}
+  //input_queues_byte_[s_id][inport][outlink] += msg->byteLength();
+  input_queues_byte_[s_id][outlink] += msg->byteLength();
+  if (now_ < next_xbar_in_free_[s_id][inport]) {
+    //std::cout << "Test 0 in input_queue of flex_lion/slingshot_switch.cc s_id " << s_id << " inport " << inport << " outlink " << outlink << " now: " << now_.nsec() << " next: " << next_xbar_in_free_[s_id][inport].nsec() << std::endl;
+    fflush(stdout);
+    return;
+  }
+  int outport = earliest_port(s_id, outlink);//adaptive_routing and wavelength reconfiguration?//now?
+    //if (inport >= num_links_per_switch_ && outlink >= num_links_per_switch_) {
+    //  std::cout << "Test 2 in input_queue of flex_lion/slingshot_switch.cc s_id " << s_id << " inport " << inport << " outport " << outport << " outlink " << outlink << " dst " << msg->toaddr() << " msg: " << msg << " now: " << now_.nsec() << std::endl;
+    //  fflush(stdout);
+    //}
+  if (now_ < next_xbar_out_free_[s_id][outport]) {
+    //std::cout << "Test 1 in input_queue of flex_lion/slingshot_switch.cc s_id " << s_id << " outport " << outport << " now: " << now_.nsec() << " next: " << next_xbar_out_free_[s_id][outport].nsec() << std::endl;
+    fflush(stdout);
+    return;
+  }
+  crossbar(s_id, outport, outlink, inport);
+}
+
+void SlingshotSwitch::crossbar(int s_id, int outport, int outlink, int inport)
+{
+  Timestamp now_ = now();
+  //std::cout << "Test -1 in corssbar of flex_lion/slingshot_switch.cc s_id " << s_id << " outlink " << outlink << " outport " << outport << " inport " << inport << " now: " << now_.nsec() << " size: " << std::endl;
+  fflush(stdout);
+  if (outport != -1) {
+    if (outlink == -1) {
+      outlink = proper_outlink(s_id, outport);
+    }
+    if (outlink == -1) {
+      return;
+    }
+#if 0
+  if (dynamic_steering_ && 
+    (outport >= (num_links_per_switch_ + num_switches_ - 1))
+  ) {
+    inport = port_pri_[s_id][outport];
+   for (int i=0; i<num_links_per_switch_; i++) {
+    inport = (inport + 1)%num_links_per_switch_;
+    //std::cout << "Test 0 in corssbar of flex_lion/slingshot_switch.cc s_id " << s_id << " outport " << outport << " inport " << inport << " now: " << now_.nsec() << " next: " << next_xbar_in_free_[s_id][inport].nsec() << " size: " << input_queues_[s_id][inport][outlink].size() << std::endl;
+    fflush(stdout);
+    if (now_ < next_xbar_in_free_[s_id][inport]) {
+      continue;
+    }
+    if (input_queues_[s_id][inport][outlink].size() > 0) {
+      NetworkMessage* msg = input_queues_[s_id][inport][outlink].front();
+      //std::cout << "Test 1 in corssbar of flex_lion/slingshot_switch.cc s_id " << s_id << " outlink " << outlink << " outport " << outport << " inport " << inport << " now: " << now_.nsec() << " size: " << input_queues_[s_id][inport][outlink].size() << " msg " << msg << std::endl;
+      fflush(stdout);
+      input_queues_[s_id][inport][outlink].pop_front();
+      uint64_t num_bytes = msg->byteLength();
+      port_pri_[s_id][outport] = inport;
+      next_xbar_out_free_[s_id][outport] = now_ + inj_byte_delay_ * num_bytes;
+      next_xbar_in_free_[s_id][inport] = now_ + inj_byte_delay_ * num_bytes;
+      sendExecutionEvent(now_ + inj_byte_delay_ * num_bytes, newCallback(this, &SlingshotSwitch::crossbar, s_id, outport, -1, -1));
+      sendExecutionEvent(now_ + inj_byte_delay_ * num_bytes, newCallback(this, &SlingshotSwitch::crossbar, s_id, -1, -1, inport));
+      sendExecutionEvent(now_ + inj_byte_delay_ * num_bytes, newCallback(this, &SlingshotSwitch::input_queue_update, s_id, inport, outlink, num_bytes));
+      sendExecutionEvent(now_ + inj_lat_, newCallback(this, &SlingshotSwitch::forward, s_id, outport, msg));
+      return;
+    }
+   }
+  }
+#endif
+    inport = port_pri_[s_id][outport];
+   for (int i=0; i<num_ports_per_switch_; i++) {
+    inport = (inport + 1)%num_ports_per_switch_;
+    //std::cout << "Test 0 in corssbar of flex_lion/slingshot_switch.cc s_id " << s_id << " outport " << outport << " inport " << inport << " now: " << now_.nsec() << " next: " << next_xbar_in_free_[s_id][inport].nsec() << " size: " << input_queues_[s_id][inport][outlink].size() << std::endl;
+    fflush(stdout);
+    if (now_ < next_xbar_in_free_[s_id][inport]) {
+      continue;
+    }
+    if (input_queues_[s_id][inport][outlink].size() > 0) {
+      NetworkMessage* msg = input_queues_[s_id][inport][outlink].front();
+      //std::cout << "Test 1 in corssbar of flex_lion/slingshot_switch.cc s_id " << s_id << " outlink " << outlink << " outport " << outport << " inport " << inport << " now: " << now_.nsec() << " size: " << input_queues_[s_id][inport][outlink].size() << " msg " << msg << std::endl;
+      fflush(stdout);
+      input_queues_[s_id][inport][outlink].pop_front();
+      uint64_t num_bytes = msg->byteLength();
+      port_pri_[s_id][outport] = inport;
+      next_xbar_out_free_[s_id][outport] = now_ + inj_byte_delay_ * num_bytes;
+      next_xbar_in_free_[s_id][inport] = now_ + inj_byte_delay_ * num_bytes;
+      sendExecutionEvent(now_ + inj_byte_delay_ * num_bytes, newCallback(this, &SlingshotSwitch::crossbar, s_id, outport, -1, -1));
+      sendExecutionEvent(now_ + inj_byte_delay_ * num_bytes, newCallback(this, &SlingshotSwitch::crossbar, s_id, -1, -1, inport));
+      sendExecutionEvent(now_ + inj_byte_delay_ * num_bytes, newCallback(this, &SlingshotSwitch::input_queue_update, s_id, inport, outlink, num_bytes));
+      sendExecutionEvent(now_ + inj_lat_, newCallback(this, &SlingshotSwitch::forward, s_id, outport, msg));
+      return;
+    }
+   }
+  } else {
+    if (now_ < next_xbar_in_free_[s_id][inport]) {
+      //std::cout << "Maybe error in crossbar!" << std::endl;
+      return;
+    }
+    for (outlink = 0; outlink < num_ports_per_switch_; outlink++) {
+      if (input_queues_[s_id][inport][outlink].size() == 0) {
+        continue;
+      }
+      outport = earliest_port(s_id, outlink);
+      if (now_ < next_xbar_out_free_[s_id][outport]) {
+        continue;
+      }
+      //std::cout << "Test 3 in corssbar of flex_lion/slingshot_switch.cc s_id " << s_id << " outlink " << outlink << " outport " << outport << " inport " << inport << " now: " << now_.nsec() << " size: " << input_queues_[s_id][inport][outlink].size() << std::endl;
+      //fflush(stdout);
+      NetworkMessage* msg = input_queues_[s_id][inport][outlink].front();
+      //std::cout << "Test 3 in corssbar of flex_lion/slingshot_switch.cc s_id " << s_id << " outlink " << outlink << " outport " << outport << " inport " << inport << " now: " << now_.nsec() << " size: " << input_queues_[s_id][inport][outlink].size() << " msg " << msg << std::endl;
+      fflush(stdout);
+      input_queues_[s_id][inport][outlink].pop_front();
+      uint64_t num_bytes = msg->byteLength();
+      port_pri_[s_id][outport] = inport;
+      next_xbar_out_free_[s_id][outport] = now_ + inj_byte_delay_ * num_bytes;
+      next_xbar_in_free_[s_id][inport] = now_ + inj_byte_delay_ * num_bytes;
+      sendExecutionEvent(now_ + inj_byte_delay_ * num_bytes, newCallback(this, &SlingshotSwitch::crossbar, s_id, outport, -1, -1));
+      sendExecutionEvent(now_ + inj_byte_delay_ * num_bytes, newCallback(this, &SlingshotSwitch::crossbar, s_id, -1, -1, inport));
+      sendExecutionEvent(now_ + inj_byte_delay_ * num_bytes, newCallback(this, &SlingshotSwitch::input_queue_update, s_id, inport, outlink, num_bytes));
+      sendExecutionEvent(now_ + inj_lat_, newCallback(this, &SlingshotSwitch::forward, s_id, outport, msg));
+      return;
+    }
+  }
+  /**for (int i=0; i<num_switches_; i++) {
+    for (int j=0; j<num_ports_per_switch_;j++) {
+      for (int k=0; k<num_ports_per_switch_;k++) {
+        if (input_queues_[i][j][k].size() > 0) {
+          std::cout << "Maybe error! s_id: " << i << " inport: " << j << " outlink: " << k << " size: " << input_queues_[i][j][k].size() << " msg " << input_queues_[i][j][k].front() << " next in: " << next_xbar_in_free_[i][j].nsec() << " out: " << next_xbar_out_free_[i][k].nsec() << " now: " << now_.nsec() << std::endl;
+        }
+      }
+    }
+  }/**/
+}
+
+void SlingshotSwitch::forward(int s_id, int outport, NetworkMessage* msg)
+{
+  //std::cout << "Test 1 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+  fflush(stdout);
+  Timestamp now_ = now();
+  //get port and wave id / based on s_id and outport for link
+  // 16 + 31 
+  //std::cout << "Test -1 in forward of flex_lion/slingshot_switch.cc s_id " << s_id << " outport " << outport << " msg " << msg << std::endl;
+    fflush(stdout);
+  if (outport < num_links_per_switch_) {
+    stat_ele_forward_counting_++;
+    int port_id = s_id * num_nodes_per_switch_ + outport/num_links_per_node_;
+    int wave_id = outport%num_links_per_node_;
+    //std::cout << "Test 00 in forward of flex_lion/slingshot_switch.cc s_id " << s_id << " outport " << outport << " port_id " << port_id << " wave_id " << wave_id << " ToR_id " << ToR_id_ << std::endl;
+    fflush(stdout);
+    stat_inter_rack_lat_counting_[msg->fromaddr()/num_nodes_] += (now_ - msg->injectionStarted()).nsec();
+    //std::cout << "Test 01 in forward of flex_lion/slingshot_switch.cc s_id " << s_id << " outport " << outport << " port_id " << port_id << " wave_id " << wave_id << " ToR_id " << ToR_id_ << " size " << local_links_.size() << " size_of_port_id " << local_links_[port_id].size() << std::endl;
+    fflush(stdout);
+    local_links_[port_id][wave_id]->locSend(msg);
+    //std::cout << "Test 02 in forward of flex_lion/slingshot_switch.cc s_id " << s_id << " outport " << outport << " port_id " << port_id << " wave_id " << wave_id << " ToR_id " << ToR_id_ << std::endl;
+    fflush(stdout);
+  } else if (outport >= (num_links_per_switch_ + num_switches_ - 1)) {
+    //std::cout << "Test 10 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+    fflush(stdout);
+    stat_opt_forward_counting_++;
+
+    int outport_offset = outport - num_links_per_switch_ - num_switches_ + 1;
+
+    int num_layer_0_per_link_ports = (num_links_layer_0_+num_switches_-1)/num_switches_;//wavelengths / switches
+    int num_layer_1_per_link_ports = (num_links_layer_1_+num_switches_-1)/num_switches_;
+    int num_layer_2_per_link_ports = (num_links_layer_2_+num_switches_-1)/num_switches_;
+
+    int num_layer_0_ports = num_ports_per_link_layer_0_*num_layer_0_per_link_ports; //ports per link
+    int num_layer_1_ports = num_ports_per_link_layer_1_*num_layer_1_per_link_ports;
+    int num_layer_2_ports = num_ports_per_link_layer_2_*num_layer_2_per_link_ports;
+
+    //Timestamp start_send = now_ ;
+    TimeDelta time_to_inject = forward_byte_delay_ * msg->byteLength();
+    int tmp_port_idx = -1;
+    //>= next_forward_layer_0_free_[earliest_idx] ? now_ : next_out_free_[earliest_idx];
+    if (outport_offset < num_layer_0_ports) {
+      //std::cout << "Test 101 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+      fflush(stdout);
+      //int port_id = (outport_offset/num_layer_0_per_link_ports) + num_nodes_;
+      int port_id = outport_offset/num_layer_0_per_link_ports;
+      int wave_id = (outport_offset%num_layer_0_per_link_ports)*num_switches_ + s_id;
+      //std::cout << "Test 1011 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+      fflush(stdout);
+      //tmp_port_idx = port_id*num_ports_per_link_layer_0_+wave_id;
+      tmp_port_idx = num_ports_per_link_layer_0_*wave_id+port_id;
+      //std::cout << "Test 1012 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+      fflush(stdout);
+      Timestamp start_send = (now_ >= next_forward_layer_0_free_[tmp_port_idx]) ? now_ : next_forward_layer_0_free_[tmp_port_idx];
+      //std::cout << "Test 1013 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << " tmp_port_idx " << tmp_port_idx << " next_forward_layer_0_free_ " << next_forward_layer_0_free_.size() << std::endl;
+      fflush(stdout);
+      next_forward_layer_0_free_[tmp_port_idx] = start_send + time_to_inject;
+      //std::cout << "Test 1014 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+      fflush(stdout);
+      //std::cout << "Test 10 in forward of flex_lion/slingshot_switch.cc ToR_id " << ToR_id_ << " s_id " << s_id << " port_id " << port_id << " wave_id " << wave_id << " ouport_offset " << outport_offset << " dst " << msg->toaddr() << " outport " << outport << " msg " <<  msg << std::endl;
+      sendExecutionEvent(start_send, newCallback(this, &SlingshotSwitch::output_port, 0, port_id, wave_id, -1, msg));
+      //std::cout << "Test 102 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+      fflush(stdout);
+      //output_port(0, port_id, wave_id, -1, msg);
+    } else if (outport_offset < num_layer_0_ports + num_layer_1_ports) {
+      //std::cout << "Test 103 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+      fflush(stdout);
+      int tmp_outport_offset = outport_offset - num_layer_0_ports;
+      //int port_id = (tmp_outport_offset/num_layer_1_per_link_ports) + num_nodes_ + num_ports_per_link_layer_0_;
+      int port_id = tmp_outport_offset/num_layer_1_per_link_ports;
+      int wave_id = (tmp_outport_offset%num_layer_1_per_link_ports)*num_switches_ + s_id;
+      tmp_port_idx = port_id*num_ports_per_link_layer_1_+wave_id;
+      Timestamp start_send = (now_ >= next_forward_layer_1_free_[tmp_port_idx]) ? now_ : next_forward_layer_1_free_[tmp_port_idx];
+      next_forward_layer_1_free_[tmp_port_idx] = start_send + time_to_inject;
+    //std::cout << "Test 11 in forward of flex_lion/slingshot_switch.cc s_id " << s_id << " port_id " << port_id << " wave_id " << wave_id << std::endl;
+    fflush(stdout);
+      sendExecutionEvent(start_send, newCallback(this, &SlingshotSwitch::output_port, 1, port_id, wave_id, -1, msg));
+      //std::cout << "Test 104 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+      fflush(stdout);
+      //output_port(1, port_id, wave_id, -1, msg);
+    } else if (outport_offset < num_layer_0_ports + num_layer_1_ports + num_layer_2_ports) {
+      //std::cout << "Test 105 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+      fflush(stdout);
+      int tmp_outport_offset = outport_offset - num_layer_0_ports - num_layer_1_ports;
+      //int port_id = (tmp_outport_offset/num_layer_2_per_link_ports) + num_nodes_ + num_ports_per_link_layer_0_ + num_ports_per_link_layer_1_;
+      int port_id = tmp_outport_offset/num_layer_2_per_link_ports;
+      int wave_id = (tmp_outport_offset%num_layer_2_per_link_ports)*num_switches_ + s_id;
+      tmp_port_idx = port_id*num_ports_per_link_layer_2_+wave_id;
+      Timestamp start_send = (now_ >= next_forward_layer_2_free_[tmp_port_idx]) ? now_ : next_forward_layer_2_free_[tmp_port_idx];
+      next_forward_layer_2_free_[tmp_port_idx] = start_send + time_to_inject;
+    //std::cout << "Test 12 in forward of flex_lion/slingshot_switch.cc s_id " << s_id << " port_id " << port_id << " wave_id " << wave_id << std::endl;
+    fflush(stdout);
+      sendExecutionEvent(start_send, newCallback(this, &SlingshotSwitch::output_port, 2, port_id, wave_id, -1, msg));
+      //output_port(2, port_id, wave_id, -1, msg);
+      //std::cout << "Test 106 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+      fflush(stdout);
+    }
+
+    //std::cout << "Test 11 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+    fflush(stdout);
+  } else {
+    //std::cout << "Test 12 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+    fflush(stdout);
+    stat_ele_forward_counting_++;
+  //using input_queue send to neighbour switch
+    int dst_port = outport - num_links_per_switch_;
+    if (s_id <= dst_port) {
+      //std::cout << "Test 21 in forward of flex_lion/slingshot_switch.cc s_id " << s_id << " outport " << outport << " dst_s_id " << dst_port+1 << " dst_inport " << num_links_per_switch_+s_id << std::endl;
+      fflush(stdout);
+      sendExecutionEvent(now_ + inter_lat_, newCallback(this, &SlingshotSwitch::input_queue, dst_port+1, num_links_per_switch_+s_id, msg));
+      //input_queue(dst_port+1, num_links_per_switch_ + s_id, msg);
+    } else {
+      //std::cout << "Test 22 in forward of flex_lion/slingshot_switch.cc s_id " << s_id << " outport " << outport << " dst_s_id " << dst_port << " dst_inport " << num_links_per_switch_+s_id-1 << std::endl;
+      fflush(stdout);
+      sendExecutionEvent(now_ + inter_lat_, newCallback(this, &SlingshotSwitch::input_queue, dst_port, num_links_per_switch_+s_id-1, msg));
+      //input_queue(dst_port, num_links_per_switch_ + s_id - 1, msg);
+    }
+    //std::cout << "Test 13 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+    fflush(stdout);
+  }
+  //std::cout << "Test -2 in forward of flex_lion/slingshot_switch.cc s_id " << s_id << " outport " << outport << " msg " << msg << std::endl;
+    fflush(stdout);
+  
+  //std::cout << "Test 2 in Slingshot with rack " << ToR_id_ << " size " << local_links_[1].size() << std::endl;
+  fflush(stdout);
+}
+
+void SlingshotSwitch::output_port(int layer_id, int port_id, int wave_id, int config_id, NetworkMessage* msg)
+{
+  int dst_node_id = msg->toaddr();
+  int dst_ToR_id = dst_node_id/num_nodes_;
+  int dst_layer_0_idx = dst_ToR_id % (num_links_layer_0_ + 1);
+  int dst_layer_1_idx = (dst_ToR_id/(num_links_layer_0_ + 1))%(num_links_layer_1_ + 1);
+  int dst_layer_2_idx = (dst_ToR_id/((num_links_layer_0_ + 1)*(num_links_layer_1_ + 1)))%(num_links_layer_2_ + 1);
+      // send to AWGR or ROS?
+    //std::cout << "Test -1 in output_port of flex_lion/slingshot_switch.cc layer_id " << layer_id << " port_id " << port_id << " wave_id " << wave_id << " config_id " << config_id << " value " << layer_0_config_[port_id][wave_id] << " ToR_id " << ToR_id_ << std::endl;
+    fflush(stdout);
+  if (config_id == -1) {
+    //simply assume that all port has same configuration for same wave_id
+    if(layer_id == 0) {
+    //std::cout << "Test 0 in output_port of flex_lion/slingshot_switch.cc layer_id " << layer_id << " port_id " << port_id << " wave_id " << wave_id << " config_id " << config_id << " value " << layer_0_config_[port_id][wave_id] << " ToR_id " << ToR_id_ << std::endl;
+    fflush(stdout);
+      if(layer_0_config_[port_id][wave_id] == 0) {
+        layer_0_links_[port_id][wave_id]->locSend(msg);
+      } else if (layer_0_config_[port_id][wave_id] == 1) {
+        layer_0_r_links_[port_id][wave_id]->locSend(msg);
+      } else {
+        //if (wave_id == (dst_layer_0_idx - ((layer_0_idx_ > dst_layer_0_idx)?0:1))) 
+        if (layer_0_ds_dst_ == dst_layer_0_idx) 
+        {
+    //std::cout << "Test 0 in output_port of flex_lion/slingshot_switch.cc layer_id " << layer_id << " port_id " << port_id << " wave_id " << wave_id << " config_id " << config_id << " value " << layer_0_config_[port_id][wave_id] << " ToR_id " << ToR_id_ << " dst_ToR_id " << dst_ToR_id << std::endl;
+          //layer_0_links_[port_id][wave_id]->locSend(msg);
+          layer_0_r_links_[port_id][wave_id]->locSend(msg);
+        } else {
+    //std::cout << "Test 1 in output_port of flex_lion/slingshot_switch.cc layer_id " << layer_id << " port_id " << port_id << " wave_id " << wave_id << " config_id " << config_id << " value " << layer_0_config_[port_id][wave_id] << " ToR_id " << ToR_id_ << " dst_ToR_id " << dst_ToR_id << std::endl;
+          //layer_0_r_links_[port_id][wave_id]->locSend(msg);
+          layer_0_links_[port_id][wave_id]->locSend(msg);
+        }
+      }
+    fflush(stdout);
+    }
+
+    if(layer_id == 1) {
+      if(layer_1_config_[port_id][wave_id] == 0) {
+        layer_1_links_[port_id][wave_id]->locSend(msg);
+      } else if (layer_1_config_[port_id][wave_id] == 1) {
+        layer_1_r_links_[port_id][wave_id]->locSend(msg);
+      }
+    }
+
+    if(layer_id == 2) {
+      if(layer_2_config_[port_id][wave_id] == 0) {
+        layer_2_links_[port_id][wave_id]->locSend(msg);
+      } else if (layer_2_config_[port_id][wave_id] == 1) {
+        layer_2_r_links_[port_id][wave_id]->locSend(msg);
+      }
+    }
+  } else {
+  }
+    //std::cout << "Test 2 in output_port of flex_lion/slingshot_switch.cc layer_id " << layer_id << " port_id " << port_id << " wave_id " << wave_id << " config_id " << config_id << " value " << layer_0_config_[port_id][wave_id] << " ToR_id " << ToR_id_ << std::endl;
+    fflush(stdout);
+}
+
+bool SlingshotSwitch::check_inter_link(int s_id, int dst_id, int layer, bool larger)
+{
+  if (layer == 2) {
+    for (int i=0; i<layer_2_bw_steering_[dst_id].size(); i++) {
+      if (s_id == ((layer_2_bw_steering_[dst_id][i]-(larger?0:1))%num_switches_)) {
+        return true;
+      }
+    }
+    if (layer_2_bw_steering_[dst_id].size() == 0) {
+      for (int i=0; i<layer_2_shortest_routing_[dst_id].size(); i++) {
+        if (s_id == ((layer_2_shortest_routing_[dst_id][i]-(larger?0:1))%num_switches_)) {
+          return true;
+        }
+      }
+    }
+  }
+  if (layer == 1) {
+    for (int i=0; i<layer_1_bw_steering_[dst_id].size(); i++) {
+      if (s_id == ((layer_1_bw_steering_[dst_id][i]-(larger?0:1))%num_switches_)) {
+        return true;
+      }
+    }
+    if (layer_1_bw_steering_[dst_id].size() == 0) {
+      for (int i=0; i<layer_1_shortest_routing_[dst_id].size(); i++) {
+        if (s_id == ((layer_1_shortest_routing_[dst_id][i]-(larger?0:1))%num_switches_)) {
+          return true;
+        }
+      }
+    }
+  }
+  if (layer == 0) {
+    for (int i=0; i<layer_0_bw_steering_[dst_id].size(); i++) {
+      larger = (layer_0_idx_ > layer_0_bw_steering_[dst_id][i]);
+      //std::cout << "Test 0 in check_inter_link ToR_id " << ToR_id_ << " s_id " << s_id << " dst_id " << dst_id << " idx " << i << " bw_steering " << layer_0_bw_steering_[dst_id][i] << std::endl;
+      if (s_id == ((layer_0_bw_steering_[dst_id][i]-(larger?0:1))%num_switches_)) {
+        //std::cout << "Test 0 in check_inter_link return s_id " << s_id << " dst_id " << dst_id << " bw_steering " << layer_0_bw_steering_[dst_id][i] << std::endl;
+        fflush(stdout);
+        return true;
+      }
+    }
+    if (layer_0_bw_steering_[dst_id].size() == 0) {
+      for (int i=0; i<layer_0_shortest_routing_[dst_id].size(); i++) {
+        larger = (layer_0_idx_ > layer_0_shortest_routing_[dst_id][i]);
+        //std::cout << "Test 1 in check_inter_link ToR_id " << ToR_id_ << " s_id " << s_id << " dst_id " << dst_id << " idx " << i << " shortest_routing " << layer_0_shortest_routing_[dst_id][i] << std::endl;
+        if (s_id == ((layer_0_shortest_routing_[dst_id][i]-(larger?0:1))%num_switches_)) {
+          //std::cout << "Test 1 in check_inter_link return s_id " << s_id << " dst_id " << dst_id << " shortest_routing " << layer_0_shortest_routing_[dst_id][i] << std::endl;
+          fflush(stdout);
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+int SlingshotSwitch::earliest_inter_port(int s_id, int dst_id, int layer, bool larger)
+{
+  int proper_port_id = -1;
+  int tmp_port_id = -1;
+  long long tmp_port_length = 1000000000000000000;
+
+  if (layer == 2) {
+    int dst_layer_2_idx = -1;
+    for (int i=0; i<layer_2_bw_steering_[dst_id].size(); i++) {
+      dst_layer_2_idx = layer_2_bw_steering_[dst_id][i];
+      if (larger) {
+        tmp_port_id = ((s_id > (dst_layer_2_idx%num_switches_))?(dst_layer_2_idx%num_switches_):((dst_layer_2_idx - 1)%num_switches_))+num_links_per_switch_;
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+      } else {
+        tmp_port_id = ((s_id > ((dst_layer_2_idx - 1)%num_switches_))?((dst_layer_2_idx - 1)%num_switches_):((dst_layer_2_idx - 2)%num_switches_))+num_links_per_switch_;
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+      }
+    }
+    if (layer_2_bw_steering_[dst_id].size() == 0) {
+      for (int i=0; i<layer_2_shortest_routing_[dst_id].size(); i++) {
+        dst_layer_2_idx = layer_2_shortest_routing_[dst_id][i];
+        if (larger) {
+          tmp_port_id = ((s_id > (dst_layer_2_idx%num_switches_))?(dst_layer_2_idx%num_switches_):((dst_layer_2_idx - 1)%num_switches_))+num_links_per_switch_;
+          if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+          }
+        } else {
+          tmp_port_id = ((s_id > ((dst_layer_2_idx - 1)%num_switches_))?((dst_layer_2_idx - 1)%num_switches_):((dst_layer_2_idx - 2)%num_switches_))+num_links_per_switch_;
+          if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+          }
+        }
+      }
+    }
+  }
+
+  if (layer == 1) {
+    int dst_layer_1_idx = -1;
+    for (int i=0; i<layer_1_bw_steering_[dst_id].size(); i++) {
+      dst_layer_1_idx = layer_1_bw_steering_[dst_id][i];
+      if (larger) {
+        tmp_port_id = ((s_id > (dst_layer_1_idx%num_switches_))?(dst_layer_1_idx%num_switches_):((dst_layer_1_idx - 1)%num_switches_))+num_links_per_switch_;
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+      } else {
+        tmp_port_id = ((s_id > ((dst_layer_1_idx - 1)%num_switches_))?((dst_layer_1_idx - 1)%num_switches_):((dst_layer_1_idx - 2)%num_switches_))+num_links_per_switch_;
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+      }
+    }
+    if (layer_1_bw_steering_[dst_id].size() == 0) {
+      for (int i=0; i<layer_1_shortest_routing_[dst_id].size(); i++) {
+        dst_layer_1_idx = layer_1_shortest_routing_[dst_id][i];
+        if (larger) {
+          tmp_port_id = ((s_id > (dst_layer_1_idx%num_switches_))?(dst_layer_1_idx%num_switches_):((dst_layer_1_idx - 1)%num_switches_))+num_links_per_switch_;
+          if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+          }
+        } else {
+          tmp_port_id = ((s_id > ((dst_layer_1_idx - 1)%num_switches_))?((dst_layer_1_idx - 1)%num_switches_):((dst_layer_1_idx - 2)%num_switches_))+num_links_per_switch_;
+          if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+          }
+        }
+      }
+    }
+  }
+
+  if (layer == 0) {
+    int dst_layer_0_idx = -1;
+    for (int i=0; i<layer_0_bw_steering_[dst_id].size(); i++) {
+      dst_layer_0_idx = layer_0_bw_steering_[dst_id][i];
+      larger = (layer_0_idx_ > dst_layer_0_idx);
+      if (larger) {
+        tmp_port_id = ((s_id > (dst_layer_0_idx%num_switches_))?(dst_layer_0_idx%num_switches_):((dst_layer_0_idx - 1)%num_switches_))+num_links_per_switch_;
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+      } else {
+        tmp_port_id = ((s_id > ((dst_layer_0_idx - 1)%num_switches_))?((dst_layer_0_idx - 1)%num_switches_):((dst_layer_0_idx - 2)%num_switches_))+num_links_per_switch_;
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+      }
+    }
+    //if (layer_0_bw_steering_[dst_id].size() == 0) {
+      for (int i=0; i<layer_0_shortest_routing_[dst_id].size(); i++) {
+        dst_layer_0_idx = layer_0_shortest_routing_[dst_id][i];
+        larger = (layer_0_idx_ > dst_layer_0_idx);
+        if (larger) {
+          tmp_port_id = ((s_id > (dst_layer_0_idx%num_switches_))?(dst_layer_0_idx%num_switches_):((dst_layer_0_idx - 1)%num_switches_))+num_links_per_switch_;
+          if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_;
+          }
+        } else {
+          tmp_port_id = ((s_id > ((dst_layer_0_idx - 1)%num_switches_))?((dst_layer_0_idx - 1)%num_switches_):((dst_layer_0_idx - 2)%num_switches_))+num_links_per_switch_;
+          if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_;
+          }
+        }
+      }
+    //}
+  }
+  return proper_port_id;
+}
+
+int SlingshotSwitch::input_routing(int s_id, NetworkMessage* msg)
+{
+  int dst_node_id = msg->toaddr();
+  int dst_ToR_id = dst_node_id/num_nodes_;
+  //int dst_s_id = s_id;
+  //int dst_p_id = 0;
+
+  //int tmp_port_id = -1;
+  //int proper_port_id = -1;
+  //long long tmp_port_length = 1000000000000;
+
+  if (dst_ToR_id != ToR_id_) {
+    int dst_layer_0_idx = dst_ToR_id % (num_links_layer_0_ + 1);
+    int dst_layer_1_idx = (dst_ToR_id/(num_links_layer_0_ + 1))%(num_links_layer_1_ + 1);
+    int dst_layer_2_idx = (dst_ToR_id/((num_links_layer_0_ + 1)*(num_links_layer_1_ + 1)))%(num_links_layer_2_ + 1);
+
+    int num_layer_0_per_link_ports = (num_links_layer_0_+num_switches_-1)/num_switches_;//wavelengths / switches
+    int num_layer_1_per_link_ports = (num_links_layer_1_+num_switches_-1)/num_switches_;
+
+    int num_layer_0_ports = num_ports_per_link_layer_0_*num_layer_0_per_link_ports; //ports per link
+    int num_layer_1_ports = num_ports_per_link_layer_1_*num_layer_1_per_link_ports;
+
+    int tmp_port_id = -1;
+    //int next_s_id = -1;
+    int next_port_id = -1;
+    int proper_port_id = -1;
+    long long tmp_port_length = 1000000000000000000;
+
+    int alter_port = (num_switches_ > num_links_layer_2_)?num_links_layer_2_:num_switches_;
+
+    if (dst_layer_2_idx < layer_2_idx_) {
+      if (s_id == (dst_layer_2_idx%num_switches_)) {
+        return num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + num_layer_1_ports + dst_layer_2_idx/num_switches_;
+      } else {
+        if((!adaptive_routing_) && (!dynamic_steering_)) {
+          return ((s_id > (dst_layer_2_idx%num_switches_))?(dst_layer_2_idx%num_switches_):((dst_layer_2_idx - 1)%num_switches_))+num_links_per_switch_;
+        }
+        tmp_port_id = ((s_id > (dst_layer_2_idx%num_switches_))?(dst_layer_2_idx%num_switches_):((dst_layer_2_idx - 1)%num_switches_))+num_links_per_switch_;
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+    if(adaptive_routing_) {
+        for(int idx_i=0; idx_i<(alter_port-((s_id < alter_port)?1:0)); idx_i++) {
+          tmp_port_id = num_links_per_switch_ + ((s_id+idx_i)%(alter_port-((s_id < alter_port)?1:0)));
+          if (tmp_port_length > (input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_)) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_;
+          }
+        }
+        next_port_id = num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + num_layer_1_ports;
+        for(int idx_i=0; idx_i<(((num_links_layer_2_+num_switches_-1)/num_switches_)-((s_id < (num_links_layer_2_%num_switches_))?0:1)); idx_i++) {
+          if ((tmp_port_length > input_queues_byte_[s_id][next_port_id] + thr_inter_rack_)) {
+            proper_port_id = next_port_id;
+            tmp_port_length = input_queues_byte_[s_id][next_port_id] + thr_inter_rack_;
+          }
+          next_port_id++;
+        }
+    }
+      }
+    } else if (dst_layer_2_idx > layer_2_idx_) {
+      if (s_id == ((dst_layer_2_idx - 1)%num_switches_)) {
+        return num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + num_layer_1_ports + (dst_layer_2_idx - 1)/num_switches_;
+      } else {
+        if((!adaptive_routing_) && (!dynamic_steering_)) {
+          return ((s_id > ((dst_layer_2_idx - 1)%num_switches_))?((dst_layer_2_idx - 1)%num_switches_):((dst_layer_2_idx - 2)%num_switches_))+num_links_per_switch_;
+        }
+        tmp_port_id = ((s_id > ((dst_layer_2_idx - 1)%num_switches_))?((dst_layer_2_idx - 1)%num_switches_):((dst_layer_2_idx - 2)%num_switches_))+num_links_per_switch_;
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+    if(adaptive_routing_) {
+        for(int idx_i=0; idx_i<(alter_port-((s_id < alter_port)?1:0)); idx_i++) {
+          tmp_port_id = num_links_per_switch_ + ((s_id+idx_i)%(alter_port-((s_id < alter_port)?1:0)));
+          //tmp_port_id = num_links_per_switch_ + idx_i;
+          if (tmp_port_length > (input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_)) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_;
+          }
+        }
+        next_port_id = num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + num_layer_1_ports;
+        for(int idx_i=0; idx_i<(((num_links_layer_2_+num_switches_-1)/num_switches_)-((s_id < (num_links_layer_2_%num_switches_))?0:1)); idx_i++) {
+          if (tmp_port_length > input_queues_byte_[s_id][next_port_id] + thr_inter_rack_) {
+            proper_port_id = next_port_id;
+            tmp_port_length = input_queues_byte_[s_id][next_port_id] + thr_inter_rack_;
+          }
+          next_port_id++;
+        }
+    }
+      }
+    }
+    //else {
+    alter_port = (num_switches_ > num_links_layer_1_)?num_links_layer_1_:num_switches_;
+    if (dst_layer_1_idx < layer_1_idx_) {
+      if (s_id == (dst_layer_1_idx%num_switches_)) {
+        return num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + dst_layer_1_idx/num_switches_;
+      } else {
+        if((!adaptive_routing_) && (!dynamic_steering_)) {
+          return ((s_id > (dst_layer_1_idx%num_switches_))?(dst_layer_1_idx%num_switches_):((dst_layer_1_idx - 1)%num_switches_))+num_links_per_switch_;
+        }
+        tmp_port_id = ((s_id > (dst_layer_1_idx%num_switches_))?(dst_layer_1_idx%num_switches_):((dst_layer_1_idx - 1)%num_switches_))+num_links_per_switch_;
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+    if(adaptive_routing_) {
+        for(int idx_i=0; idx_i<(alter_port-((s_id < alter_port)?1:0)); idx_i++) {
+          tmp_port_id = num_links_per_switch_ + ((s_id+idx_i)%(alter_port-((s_id < alter_port)?1:0)));
+          //tmp_port_id = num_links_per_switch_ + idx_i;
+          if (tmp_port_length > (input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_)) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_;
+          }
+        }
+        next_port_id = num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports;
+        for(int idx_i=0; idx_i<(((num_links_layer_1_+num_switches_-1)/num_switches_)-((s_id < (num_links_layer_1_%num_switches_))?0:1)); idx_i++) {
+          if (tmp_port_length > input_queues_byte_[s_id][next_port_id] + thr_inter_rack_) {
+            proper_port_id = next_port_id;
+            tmp_port_length = input_queues_byte_[s_id][next_port_id] + thr_inter_rack_;
+          }
+          next_port_id++;
+        }
+    }
+      }
+    } else if (dst_layer_1_idx > layer_1_idx_) {
+      if (s_id == ((dst_layer_1_idx - 1)%num_switches_)) {
+        return num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + (dst_layer_1_idx - 1)/num_switches_;
+      } else {
+        if((!adaptive_routing_) && (!dynamic_steering_)) {
+          return ((s_id > ((dst_layer_1_idx - 1)%num_switches_))?((dst_layer_1_idx - 1)%num_switches_):((dst_layer_1_idx - 2)%num_switches_))+num_links_per_switch_;
+        }
+        tmp_port_id = ((s_id > ((dst_layer_1_idx - 1)%num_switches_))?((dst_layer_1_idx - 1)%num_switches_):((dst_layer_1_idx - 2)%num_switches_))+num_links_per_switch_;
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+    if(adaptive_routing_) {
+        for(int idx_i=0; idx_i<(alter_port-((s_id < alter_port)?1:0)); idx_i++) {
+          tmp_port_id = num_links_per_switch_ + ((s_id+idx_i)%(alter_port-((s_id < alter_port)?1:0)));
+          //tmp_port_id = num_links_per_switch_ + idx_i;
+          if (tmp_port_length > (input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_)) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_;
+          }
+        }
+        next_port_id = num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports;
+        for(int idx_i=0; idx_i<(((num_links_layer_1_+num_switches_-1)/num_switches_)-((s_id < (num_links_layer_1_%num_switches_))?0:1)); idx_i++) {
+          if (tmp_port_length > input_queues_byte_[s_id][next_port_id] + thr_inter_rack_) {
+            proper_port_id = next_port_id;
+            tmp_port_length = input_queues_byte_[s_id][next_port_id] + thr_inter_rack_;
+          }
+          next_port_id++;
+        }
+    }
+      }
+    }
+      //else {
+    alter_port = (num_switches_ > num_links_layer_0_)?num_links_layer_0_:num_switches_;
+    if (dst_layer_0_idx < layer_0_idx_) {
+      //if (s_id == (dst_layer_0_idx%num_switches_))
+      if (check_inter_link(s_id, dst_layer_0_idx, 0, true))
+      {
+        //std::cout << "Test 0 in input_routing with s_id " << s_id << " dst_layer_0_idx " << dst_layer_0_idx << " ToR_id " << ToR_id_ << " msg " << msg << std::endl;
+        //std::cout << "Test -1 in input_routing for ToR_id " << ToR_id_ << " dst_ToR_id " << dst_ToR_id << " s_id " << s_id << " proper_port_id " << num_links_per_switch_ + num_switches_ - 1 + dst_layer_0_idx/num_switches_ << " msg " << msg << std::endl;
+        return num_links_per_switch_ + num_switches_ - 1 + dst_layer_0_idx/num_switches_;
+      } else {
+        if((!adaptive_routing_) && (!dynamic_steering_) && (!bandwidth_steering_)) {
+          return ((s_id > (dst_layer_0_idx%num_switches_))?(dst_layer_0_idx%num_switches_):((dst_layer_0_idx - 1)%num_switches_))+num_links_per_switch_;
+        }
+        //tmp_port_id = ((s_id > (dst_layer_0_idx%num_switches_))?(dst_layer_0_idx%num_switches_):((dst_layer_0_idx - 1)%num_switches_))+num_links_per_switch_;
+        tmp_port_id = earliest_inter_port(s_id, dst_layer_0_idx, 0, true);
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+    if(adaptive_routing_) {
+      //if ((ToR_id_ == msg->fromaddr()/num_nodes_)
+      //  && (s_id == (msg->fromaddr()%num_nodes_)/num_nodes_per_switch_)
+      //   ) {
+        for(int idx_i=0; idx_i<(alter_port-((s_id < alter_port)?1:0)); idx_i++) {
+          tmp_port_id = num_links_per_switch_ + ((s_id+idx_i)%(alter_port-((s_id < alter_port)?1:0)));
+          //tmp_port_id = num_links_per_switch_ + idx_i;
+          //if ((tmp_port_length > (input_queues_byte_[s_id][tmp_port_id] + 2000)) || (input_queues_byte_[s_id][tmp_port_id] == 0))
+          if ((tmp_port_length > (input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_))) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_;
+          }
+        }
+      //}
+        /**
+        for(int idx_i=0; idx_i<(num_switches_-1); idx_i++) {
+          tmp_port_id = num_links_per_switch_ + ((s_id+idx_i)%(num_switches_-1));
+          //tmp_port_id = num_links_per_switch_ + idx_i;
+          if (tmp_port_length > (input_queues_byte_[s_id][tmp_port_id] + 2000)) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + 2000;
+          }
+        }
+        /**/
+        next_port_id = num_links_per_switch_ + num_switches_ - 1;
+        for(int idx_i=0; idx_i<(((num_links_layer_0_+num_switches_-1)/num_switches_)-((s_id < (num_links_layer_0_%num_switches_))?0:1)); idx_i++) {
+          //if ((tmp_port_length > input_queues_byte_[s_id][next_port_id] + 4000) || (input_queues_byte_[s_id][next_port_id] == 0))
+          if ((tmp_port_length > input_queues_byte_[s_id][next_port_id] + thr_inter_rack_)) {
+            proper_port_id = next_port_id;
+            tmp_port_length = input_queues_byte_[s_id][next_port_id] + thr_inter_rack_;
+          }
+          next_port_id++;
+        }
+    }
+      }
+    } else if (dst_layer_0_idx > layer_0_idx_) {
+      //if (s_id == ((dst_layer_0_idx - 1)%num_switches_))
+      if (check_inter_link(s_id, dst_layer_0_idx, 0, false))
+      {
+        //std::cout << "Test 1 in input_routing with s_id " << s_id << " dst_layer_0_idx " << dst_layer_0_idx << " ToR_id " << ToR_id_ << " msg " << msg << std::endl;
+        return num_links_per_switch_ + num_switches_ - 1 + (dst_layer_0_idx - 1)/num_switches_;
+      } else {
+        if((!adaptive_routing_) && (!dynamic_steering_) && (!bandwidth_steering_)) {
+          return ((s_id > ((dst_layer_0_idx - 1)%num_switches_))?((dst_layer_0_idx - 1)%num_switches_):((dst_layer_0_idx - 2)%num_switches_))+num_links_per_switch_;
+        }
+        //tmp_port_id = ((s_id > ((dst_layer_0_idx - 1)%num_switches_))?((dst_layer_0_idx - 1)%num_switches_):((dst_layer_0_idx - 2)%num_switches_))+num_links_per_switch_;
+        tmp_port_id = earliest_inter_port(s_id, dst_layer_0_idx, 0, false);
+        //next_s_id = tmp_dst_port_id+((s_id <= tmp_dst_port_id)?1:0);
+        //next_port_id = num_links_per_switch_ + num_switches_ - 1 + (dst_layer_0_idx - 1)/num_switches_;
+        //if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id] + input_queues_byte_[next_s_id][next_port_id]) {
+        //  proper_port_id = tmp_port_id;
+        //  tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + input_queues_byte_[next_s_id][next_port_id];
+        //}
+        if (tmp_port_length > input_queues_byte_[s_id][tmp_port_id]) {
+          proper_port_id = tmp_port_id;
+          tmp_port_length = input_queues_byte_[s_id][tmp_port_id];
+        }
+    if(adaptive_routing_) {
+      if ((ToR_id_ == msg->fromaddr()/num_nodes_)
+        && (s_id == (msg->fromaddr()%num_nodes_)/num_nodes_per_switch_)
+         ) {
+        for(int idx_i=0; idx_i<(alter_port-((s_id < alter_port)?1:0)); idx_i++) {
+          tmp_port_id = num_links_per_switch_ + ((s_id+idx_i)%(alter_port-((s_id < alter_port)?1:0)));
+          //tmp_port_id = num_links_per_switch_ + idx_i;
+          //if ((tmp_port_length > (input_queues_byte_[s_id][tmp_port_id] + 2000)) || (input_queues_byte_[s_id][tmp_port_id] == 0) ) 
+          if ((tmp_port_length > (input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_))) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + thr_intra_rack_;
+          }
+        }
+      }
+        /**
+        for(int idx_i=0; idx_i<(num_switches_-1); idx_i++) {
+          tmp_port_id = num_links_per_switch_ + ((s_id+idx_i)%(num_switches_-1));
+          //tmp_port_id = num_links_per_switch_ + idx_i;
+          if (tmp_port_length > (input_queues_byte_[s_id][tmp_port_id] + 2000)) {
+            proper_port_id = tmp_port_id;
+            tmp_port_length = input_queues_byte_[s_id][tmp_port_id] + 2000;
+          }
+        }
+        /**/
+        next_port_id = num_links_per_switch_ + num_switches_ - 1;
+        for(int idx_i=0; idx_i<(((num_links_layer_0_+num_switches_-1)/num_switches_)-((s_id < (num_links_layer_0_%num_switches_))?0:1)); idx_i++) {
+          //if ((tmp_port_length > (input_queues_byte_[s_id][next_port_id] + 4000)) || (input_queues_byte_[s_id][next_port_id] == 0))
+          if ((tmp_port_length > (input_queues_byte_[s_id][next_port_id] + thr_inter_rack_))) {
+            proper_port_id = next_port_id;
+            tmp_port_length = input_queues_byte_[s_id][next_port_id] + thr_inter_rack_;
+          }
+          next_port_id++;
+        }
+    }
+      }
+    }
+
+    //std::cout << "Test 0 in input_routing for ToR_id " << ToR_id_ << " dst_ToR_id " << dst_ToR_id << " s_id " << s_id << " proper_port_id " << proper_port_id << " msg " << msg << std::endl;
+
+    return proper_port_id;
+      //}
+    //}
+  //if at different rack
+  //same pod
+  //same col
+  //same row
+  } else {
+    int dst_node_offset = dst_node_id%num_nodes_;
+    int dst_s_id = dst_node_offset/num_nodes_per_switch_;
+    if (s_id == dst_s_id) {
+      return (dst_node_offset%num_nodes_per_switch_)*num_links_per_node_;
+    } else {
+      return ((s_id > dst_s_id)?dst_s_id:(dst_s_id-1)) + num_links_per_switch_;
+    }
+  //if at different switch but at same rack
+  //if at same switch
+  }
+}
+
+#if 0
+int SlingshotSwitch::input_routing(int s_id, NetworkMessage* msg)
+{
+  int dst_node_id = msg->toaddr();
+  int dst_ToR_id = dst_node_id/num_nodes_;
+  //int dst_s_id = s_id;
+  //int dst_p_id = 0;
+
+  //int tmp_port_id = -1;
+  //int proper_port_id = -1;
+  //long long tmp_port_length = 1000000000000;
+
+  if (dst_ToR_id != ToR_id_) {
+    int dst_layer_0_idx = dst_ToR_id % (num_links_layer_0_ + 1);
+    int dst_layer_1_idx = (dst_ToR_id/(num_links_layer_0_ + 1))%(num_links_layer_1_ + 1);
+    int dst_layer_2_idx = (dst_ToR_id/((num_links_layer_0_ + 1)*(num_links_layer_1_ + 1)))%(num_links_layer_2_ + 1);
+
+    int num_layer_0_per_link_ports = (num_links_layer_0_+num_switches_-1)/num_switches_;//wavelengths / switches
+    int num_layer_1_per_link_ports = (num_links_layer_1_+num_switches_-1)/num_switches_;
+
+    int num_layer_0_ports = num_ports_per_link_layer_0_*num_layer_0_per_link_ports; //ports per link
+    int num_layer_1_ports = num_ports_per_link_layer_1_*num_layer_1_per_link_ports;
+
+    if (dst_layer_2_idx < layer_2_idx_) {
+      if (s_id == (dst_layer_2_idx%num_switches_)) {
+        return num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + num_layer_1_ports + dst_layer_2_idx/num_switches_;
+      } else {
+        return ((s_id > (dst_layer_2_idx%num_switches_))?(dst_layer_2_idx%num_switches_):((dst_layer_2_idx - 1)%num_switches_))+num_links_per_switch_;
+      }
+    } else if (dst_layer_2_idx > layer_2_idx_) {
+      if (s_id == ((dst_layer_2_idx - 1)%num_switches_)) {
+        return num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + num_layer_1_ports + (dst_layer_2_idx - 1)/num_switches_;
+      } else {
+        return ((s_id > ((dst_layer_2_idx - 1)%num_switches_))?((dst_layer_2_idx - 1)%num_switches_):((dst_layer_2_idx - 2)%num_switches_))+num_links_per_switch_;
+      }
+    } else {
+      if (dst_layer_1_idx < layer_1_idx_) {
+        if (s_id == (dst_layer_1_idx%num_switches_)) {
+          return num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + dst_layer_1_idx/num_switches_;
+        } else {
+          return ((s_id > (dst_layer_1_idx%num_switches_))?(dst_layer_1_idx%num_switches_):((dst_layer_1_idx - 1)%num_switches_))+num_links_per_switch_;
+        }
+      } else if (dst_layer_1_idx > layer_1_idx_) {
+        if (s_id == ((dst_layer_1_idx - 1)%num_switches_)) {
+          return num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + (dst_layer_1_idx - 1)/num_switches_;
+        } else {
+          return ((s_id > ((dst_layer_1_idx - 1)%num_switches_))?((dst_layer_1_idx - 1)%num_switches_):((dst_layer_1_idx - 2)%num_switches_))+num_links_per_switch_;
+        }
+      } else {
+        if (dst_layer_0_idx < layer_0_idx_) {
+          if (s_id == (dst_layer_0_idx%num_switches_)) {
+            return num_links_per_switch_ + num_switches_ - 1 + dst_layer_0_idx/num_switches_;
+          } else {
+            return ((s_id > (dst_layer_0_idx%num_switches_))?(dst_layer_0_idx%num_switches_):((dst_layer_0_idx - 1)%num_switches_))+num_links_per_switch_;
+          }
+        } else if (dst_layer_0_idx > layer_0_idx_) {
+          if (s_id == ((dst_layer_0_idx - 1)%num_switches_)) {
+            return num_links_per_switch_ + num_switches_ - 1 + (dst_layer_0_idx - 1)/num_switches_;
+          } else {
+            return ((s_id > ((dst_layer_0_idx - 1)%num_switches_))?((dst_layer_0_idx - 1)%num_switches_):((dst_layer_0_idx - 2)%num_switches_))+num_links_per_switch_;
+          }
+        }
+      }
+    }
+  //if at different rack
+  //same pod
+  //same col
+  //same row
+  } else {
+    int dst_node_offset = dst_node_id%num_nodes_;
+    int dst_s_id = dst_node_offset/num_nodes_per_switch_;
+    if (s_id == dst_s_id) {
+      return (dst_node_offset%num_nodes_per_switch_)*num_links_per_node_;
+    } else {
+      return ((s_id > dst_s_id)?dst_s_id:(dst_s_id-1)) + num_links_per_switch_;
+    }
+  //if at different switch but at same rack
+  //if at same switch
+  }
+}
+#endif
+
+int SlingshotSwitch::earliest_port(int s_id, int outlink)
+{
+  //adaptive routing only for inter-switch?
+  Timestamp time_earlist = next_xbar_out_free_[s_id][outlink];
+  int outport = outlink;
+  if(outlink < num_links_per_switch_) {
+    for (int i=1; i<num_links_per_node_; i++) {
+      if (next_xbar_out_free_[s_id][outlink + i] < time_earlist) {
+        time_earlist = next_xbar_out_free_[s_id][outlink+i];
+        outport = outlink + i;
+      }
+    }
+  } else if (outlink >= num_links_per_switch_ + num_switches_ - 1) {
+
+    int out_offset = outlink - num_links_per_switch_ - num_switches_ + 1;
+
+    int num_layer_0_per_link_ports = (num_links_layer_0_+num_switches_-1)/num_switches_;//wavelengths / switches
+    int num_layer_1_per_link_ports = (num_links_layer_1_+num_switches_-1)/num_switches_;
+    int num_layer_2_per_link_ports = (num_links_layer_2_+num_switches_-1)/num_switches_;
+
+    int num_layer_0_ports = num_ports_per_link_layer_0_*num_layer_0_per_link_ports; //ports per link
+    int num_layer_1_ports = num_ports_per_link_layer_1_*num_layer_1_per_link_ports;
+    int num_layer_2_ports = num_ports_per_link_layer_2_*num_layer_2_per_link_ports;
+
+    int num_per_link_ports = num_layer_2_per_link_ports;
+
+    if (out_offset < num_layer_0_ports) {
+      num_per_link_ports = num_layer_0_per_link_ports;
+    } else if (out_offset < num_layer_0_ports + num_layer_1_ports) {
+      num_per_link_ports = num_layer_1_per_link_ports;
+    }
+
+    for (int i=1; i<num_ports_per_link_layer_0_; i++) {
+      if (next_xbar_out_free_[s_id][outlink+i*num_per_link_ports] < time_earlist) {
+        time_earlist = next_xbar_out_free_[s_id][outlink+i*num_per_link_ports];
+        outport = outlink + i*num_per_link_ports;
+      }
+    }
+  }
+  return outport;
+}
+
+/*
+int SlingshotSwitch::adaptive_routing()
+{
+  int tmp_port_id = -1;
+  int tmp_dst_port_id = -1;
+  int next_s_id = -1;
+  int next_port_id = -1;
+  int proper_port_id = -1;
+  long long tmp_port_length = 1000000000000000000;
+  tmp_port_id = ((s_id > (dst_layer_2_idx%num_switches_))?(dst_layer_2_idx%num_switches_):((dst_layer_2_idx - 1)%num_switches_))+num_links_per_switch_;
+  tmp_dst_port_id = tmp_port_id - num_links_per_switch_;
+  if (tmp_port_length > )
+}
+*/
+
+int SlingshotSwitch::proper_outlink(int s_id, int outport)
+{
+  //adaptive routing?
+  if(outport < num_links_per_switch_) {
+    return (outport/num_links_per_node_)*num_links_per_node_;
+  } else if (outport >= num_links_per_switch_ + num_switches_ - 1) {
+    int out_offset = outport - num_links_per_switch_ - num_switches_ + 1;
+
+    int num_layer_0_per_link_ports = (num_links_layer_0_+num_switches_-1)/num_switches_;//wavelengths / switches
+    int num_layer_1_per_link_ports = (num_links_layer_1_+num_switches_-1)/num_switches_;
+    int num_layer_2_per_link_ports = (num_links_layer_2_+num_switches_-1)/num_switches_;
+
+    int num_layer_0_ports = num_ports_per_link_layer_0_*num_layer_0_per_link_ports; //ports per link
+    int num_layer_1_ports = num_ports_per_link_layer_1_*num_layer_1_per_link_ports;
+    int num_layer_2_ports = num_ports_per_link_layer_2_*num_layer_2_per_link_ports;
+
+    if (out_offset < num_layer_0_ports) {
+      return (num_links_per_switch_ + num_switches_ - 1 + out_offset%num_layer_0_per_link_ports);
+    }
+    
+    out_offset = out_offset - num_layer_0_ports;
+    if (out_offset < num_layer_1_ports) {
+      return (num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + out_offset%num_layer_1_per_link_ports);
+    }
+    
+    out_offset = out_offset - num_layer_1_ports;
+    if (out_offset < num_layer_2_ports) {
+      return (num_links_per_switch_ + num_switches_ - 1 + num_layer_0_ports + num_layer_1_ports + out_offset%num_layer_2_per_link_ports);
+    }
+  }
+  return outport;
+}
+
+void SlingshotSwitch::init(unsigned int phase)
+{
+}
+
+void SlingshotSwitch::finish()
+{
+  std::cout << "stat_byte_Rack: " << ToR_id_;
+  for (int i=0; i<stat_inter_rack_byte_counting_.size(); i++) {
+    std::cout << " " << stat_inter_rack_byte_counting_[i];
+  }
+  std::cout << std::endl;
+
+  std::cout << "stat_packet_Rack: " << ToR_id_;
+  for (int i=0; i<stat_inter_rack_packet_counting_.size(); i++) {
+    std::cout << " " << stat_inter_rack_packet_counting_[i];
+  }
+  std::cout << std::endl;
+
+  std::cout << "stat_lat_Rack: " << ToR_id_;
+  for (int i=0; i<stat_inter_rack_lat_counting_.size(); i++) {
+    std::cout << " " << stat_inter_rack_lat_counting_[i];
+  }
+  std::cout << std::endl;
+
+  std::cout << ToR_id_ << " ele_forward: " << stat_ele_forward_counting_ << " opt_forward: " << stat_opt_forward_counting_ << std::endl;
+}
+
+}
+}
+
+#endif // simple_switch_CC

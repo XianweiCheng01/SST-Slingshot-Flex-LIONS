@@ -1,0 +1,9 @@
+#! /usr/bin/env bash
+
+export PYTHONPATH=/home/xianwei/local/sstmacro/include/python:/home/xianwei/local/sstmacro/lib:$PYTHONPATH
+export SST_LIB_PATH=/home/xianwei/local/sstmacro/lib:$SST_LIB_PATH
+
+options="$@"
+/home/xianwei/local/sstcore/bin/sst /home/xianwei/local/sstmacro/include/python/default.py --model-options="$options"
+
+

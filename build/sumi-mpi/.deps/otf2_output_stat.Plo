@@ -1,0 +1,4 @@
+otf2_output_stat.lo: ../../sumi-mpi/otf2_output_stat.cc \
+  ../../sumi-mpi/otf2_output_stat.h ../sstmac/common/sstmac_config.h
+../../sumi-mpi/otf2_output_stat.h:
+../sstmac/common/sstmac_config.h:

@@ -1,0 +1,4 @@
+src/sstmac_dummy_main.o: ../../bin/src/sstmac_dummy_main.cc \
+ /usr/include/stdc-predef.h
+
+/usr/include/stdc-predef.h:

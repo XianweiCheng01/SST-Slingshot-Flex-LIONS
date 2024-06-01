@@ -1,0 +1,2 @@
+threading/asm/ontop_x86_64_sysv_elf_gas.lo: \
+  ../../../sstmac/software/threading/asm/ontop_x86_64_sysv_elf_gas.S
